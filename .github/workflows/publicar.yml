@@ -14,6 +14,13 @@ name: Gerar e publicar o Bunny
 # no registro. (O instalador em si já é público: é o que o cliente baixa.)
 
 on:
+  # Um arquivo em pedidos/ é o pedido de publicação: quem sobe a versão no código escreve ali o
+  # número (ex.: pedidos/v1.28.1) e dá push. Dispara na hora, sem depender do horário nem do botão.
+  push:
+    branches: [main]
+    paths:
+      - "pedidos/**"
+      - ".github/workflows/publicar.yml"
   schedule:
     - cron: "17 * * * *"
   workflow_dispatch:
