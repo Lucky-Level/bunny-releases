@@ -1,0 +1,7 @@
+Instalador de teste do canal do WhatsApp (LID, grupos e transmissoes).
+
+Gerar a partir do ramo e nao da main: a main tem a Loja nova, que foi
+segurada de proposito ate a arte do mascote ser aprovada. Este ramo e a
+1.34.9 publicada mais a correcao do WhatsApp, e nada mais.
+
+ref: teste-grupos

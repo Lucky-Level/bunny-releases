@@ -16,6 +16,11 @@ name: Gerar e publicar o Bunny
 on:
   # Um arquivo em pedidos/ é o pedido de publicação: quem sobe a versão no código escreve ali o
   # número (ex.: pedidos/v1.28.1) e dá push. Dispara na hora, sem depender do horário nem do botão.
+  #
+  # O pedido pode dizer de qual ramo gerar, com uma linha "ref: nome-do-ramo" dentro do arquivo.
+  # Serve para gerar um instalador de teste sem publicar o que ainda está segurado na main — foi
+  # preciso no dia em que uma correção urgente do WhatsApp dividiu a main com uma Loja que estava
+  # de propósito à espera de arte aprovada. Sem a linha, continua sendo a main, como sempre.
   push:
     branches: [main]
     paths:
@@ -54,13 +59,20 @@ jobs:
       versao: ${{ steps.decisao.outputs.versao }}
       commit: ${{ steps.decisao.outputs.commit }}
     steps:
+      # Só para poder ler o pedido que acabou de ser empurrado. Dois commits bastam.
+      - name: Baixar este repositório (os pedidos)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
       - name: Ler a versão do código e comparar com o que já foi publicado
         id: decisao
         shell: bash
         env:
           SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
           GH_TOKEN: ${{ github.token }}
-          REF: ${{ inputs.ref || 'main' }}
+          REF: ${{ inputs.ref || '' }}
           REPUBLICAR: ${{ inputs.republicar || false }}
         run: |
           set -euo pipefail
@@ -68,6 +80,22 @@ jobs:
             echo "::error::Falta o segredo SOURCE_TOKEN neste repositório (token só de leitura do Lucky-Level/bunny)."
             exit 1
           fi
+          # Sem ref pedida na mão: vale o pedido que ESTE push trouxe, se ele disser de onde
+          # gerar. Olhar só o commit do topo é de propósito: assim a escolha vale para esta
+          # execução e não fica ligada para a próxima, nem para o horário de hora em hora.
+          if [ -z "$REF" ]; then
+            for arquivo in $(git show --name-only --pretty=format: HEAD -- pedidos/ || true); do
+              [ -f "$arquivo" ] || continue
+              pedida=$(grep -m1 -E '^[[:space:]]*ref:' "$arquivo" 2>/dev/null \
+                | sed -E 's/^[[:space:]]*ref:[[:space:]]*//; s/[[:space:]]+$//' || true)
+              if [ -n "$pedida" ]; then
+                echo "O pedido $(basename "$arquivo") manda gerar a partir de '$pedida'."
+                REF="$pedida"
+                break
+              fi
+            done
+          fi
+          REF="${REF:-main}"
           commit=$(GH_TOKEN="$SOURCE_TOKEN" gh api "repos/$SOURCE_REPO/commits/$REF" -q .sha)
           versao=$(GH_TOKEN="$SOURCE_TOKEN" gh api "repos/$SOURCE_REPO/contents/package.json?ref=$commit" \
             -H "Accept: application/vnd.github.raw" | jq -r .version)
