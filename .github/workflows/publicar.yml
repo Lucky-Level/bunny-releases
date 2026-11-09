@@ -134,12 +134,35 @@ jobs:
             exit 1
           }
 
+      # O electron-builder baixa nsis, nsis-resources e winCodeSign de um release do GitHub na
+      # primeira vez que empacota. Em 09/11 esse download respondeu 504 e derrubou a publicacao
+      # inteira, depois de oito minutos de compilacao. Guardados aqui, nao sao nem pedidos de novo.
+      - name: Cache das ferramentas do electron-builder
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~\AppData\Local\electron-builder\Cache
+          key: electron-builder-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: electron-builder-${{ runner.os }}-
+
       - name: Gerar o instalador
+        shell: pwsh
         env:
           # App do Google ("Entrar com Google" na Agenda). Opcionais: sem eles o resto funciona.
           BUNNY_GOOGLE_CLIENT_ID: ${{ secrets.BUNNY_GOOGLE_CLIENT_ID }}
           BUNNY_GOOGLE_CLIENT_SECRET: ${{ secrets.BUNNY_GOOGLE_CLIENT_SECRET }}
-        run: bun run dist:win
+        # Mesmo com cache, a primeira vez depois de trocar de dependencia baixa de novo, e um 504
+        # passageiro nao pode custar a publicacao inteira. Na segunda tentativa o que ja baixou
+        # continua no cache local do job, entao ela e rapida.
+        run: |
+          $ErrorActionPreference = "Continue"
+          foreach ($tentativa in 1..3) {
+            bun run dist:win
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            Write-Host "::warning::Tentativa $tentativa de empacotar falhou (codigo $LASTEXITCODE)."
+            if ($tentativa -lt 3) { Start-Sleep -Seconds (30 * $tentativa) }
+          }
+          Write-Error "Empacotar falhou tres vezes seguidas."
+          exit 1
 
       - name: Conferir os arquivos do instalador
         shell: pwsh
