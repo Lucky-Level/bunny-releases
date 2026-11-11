@@ -56,6 +56,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       gerar: ${{ steps.decisao.outputs.gerar }}
+      gerar_mac: ${{ steps.decisao.outputs.gerar_mac }}
       versao: ${{ steps.decisao.outputs.versao }}
       commit: ${{ steps.decisao.outputs.commit }}
     steps:
@@ -115,6 +116,27 @@ jobs:
           fi
           echo "versao=$versao" >> "$GITHUB_OUTPUT"
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+          # O Mac é decidido à parte e não muda nada do que vem acima: o Windows continua sendo
+          # gerado e publicado exatamente como antes. Só gera o Mac quando o código já sabe gerá-lo
+          # (scripts/gerar-mac.ts existe naquele commit) e quando falta algum dos dois .dmg.
+          if ! GH_TOKEN="$SOURCE_TOKEN" gh api "repos/$SOURCE_REPO/contents/scripts/gerar-mac.ts?ref=$commit" >/dev/null 2>&1; then
+            echo "Este commit ainda não gera o Mac."
+            echo "gerar_mac=false" >> "$GITHUB_OUTPUT"
+          else
+            faltam=0
+            for dmg in "Bunny-$versao-arm64.dmg" "Bunny-$versao-x64.dmg"; do
+              gh release view "v$versao" --repo "$GITHUB_REPOSITORY" --json assets \
+                -q ".assets[].name" 2>/dev/null | grep -Fxq "$dmg" || faltam=1
+            done
+            if [ "$faltam" = "1" ] || [ "$REPUBLICAR" = "true" ]; then
+              echo "Vou gerar o Mac da v$versao."
+              echo "gerar_mac=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "O Mac da v$versao já está publicado."
+              echo "gerar_mac=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
 
   windows:
     name: Gerar o instalador do Windows
@@ -256,4 +278,194 @@ jobs:
             sleep $((attempt * 20))
           done
           echo "Não foi possível publicar depois de 5 tentativas."
+          exit 1
+
+  # O Mac corre ao lado do Windows e não mexe nele: arquivos com outros nomes (Bunny-*-arm64.dmg,
+  # Bunny-*-x64.dmg, os .zip e o latest-mac.yml), anexados DEPOIS que o Windows publicou. Se o Mac
+  # falhar, o Windows sai igual, o workflow fica vermelho e a hora seguinte tenta de novo só o Mac.
+  # Cada arquitetura numa máquina dela: voz, ffmpeg e o navegador do WhatsApp são baixados pelo
+  # `bun install` para a arquitetura de quem empacota.
+  mac:
+    name: Gerar o Mac ${{ matrix.arch }}
+    needs: decidir
+    if: needs.decidir.outputs.gerar_mac == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+            app: dist/mac-arm64/Bunny.app
+          - arch: x64
+            runner: macos-15-intel
+            app: dist/mac/Bunny.app
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 50
+    steps:
+      - name: Baixar o código (privado, só leitura)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.decidir.outputs.commit }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - name: Instalar o Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.11
+
+      # 1.26.x de propósito: o build-backend recusa outra versão para o Mac (suporte ao macOS 12).
+      - name: Instalar o Go
+        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version: "1.26.x"
+          cache: false
+
+      - name: Instalar as dependências
+        run: bun install --frozen-lockfile
+
+      - name: Cache das ferramentas do electron-builder
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/Library/Caches/electron-builder
+          key: electron-builder-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('bun.lock') }}
+          restore-keys: electron-builder-${{ runner.os }}-${{ matrix.arch }}-
+
+      # Com os cinco segredos do electron-builder: assina com o Developer ID, notariza e liga a
+      # atualização automática. Sem eles: assinatura ad-hoc, sem notarizar, e o app avisa da versão
+      # nova em vez de se instalar sozinho. Segredo pela metade para o job (scripts/plano-do-mac.ts
+      # no código).
+      - name: Gerar o dmg e o zip
+        shell: bash
+        env:
+          BUNNY_GOOGLE_CLIENT_ID: ${{ secrets.BUNNY_GOOGLE_CLIENT_ID }}
+          BUNNY_GOOGLE_CLIENT_SECRET: ${{ secrets.BUNNY_GOOGLE_CLIENT_SECRET }}
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          for tentativa in 1 2 3; do
+            if bun scripts/gerar-mac.ts "$ARCH"; then exit 0; fi
+            echo "::warning::Tentativa $tentativa de empacotar o Mac falhou."
+            if [ "$tentativa" -lt 3 ]; then sleep $((30 * tentativa)); fi
+          done
+          echo "::error::Empacotar o Mac falhou tres vezes seguidas."
+          exit 1
+
+      - name: Conferir os arquivos do Mac
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+          APP: ${{ matrix.app }}
+          VERSAO: ${{ needs.decidir.outputs.versao }}
+          NOTARIZADO: ${{ secrets.CSC_LINK != '' && secrets.APPLE_ID != '' }}
+        run: |
+          set -euo pipefail
+          cat "$APP/Contents/Resources/app-update.yml"
+          # Arquitetura do app e do backend, assinatura íntegra (ad-hoc ou Developer ID) e abertura.
+          bun scripts/verify-macos-package.ts "$APP" "$ARCH"
+          codesign -dv --verbose=2 "$APP" 2>&1 | grep -E '^(Authority|Signature|TeamIdentifier)=' || true
+          if [ "$NOTARIZADO" = "true" ]; then
+            spctl --assess --type execute -vv "$APP"
+            xcrun stapler validate "$APP"
+          fi
+          for arquivo in "Bunny-$VERSAO-$ARCH.dmg" "Bunny-$VERSAO-$ARCH.zip"; do
+            if [ ! -f "dist/$arquivo" ]; then echo "::error::Esperava dist/$arquivo."; exit 1; fi
+          done
+          # Os dois Macs geram um latest-mac.yml cada; quem publica junta os dois num só.
+          test -f dist/latest-mac.yml
+          mv dist/latest-mac.yml "dist/latest-mac-$ARCH.yml"
+          ls -la dist
+
+      - name: Guardar os arquivos do Mac para a publicação
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mac-${{ matrix.arch }}
+          path: |
+            dist/Bunny-*-${{ matrix.arch }}.dmg
+            dist/Bunny-*-${{ matrix.arch }}.dmg.blockmap
+            dist/Bunny-*-${{ matrix.arch }}.zip
+            dist/Bunny-*-${{ matrix.arch }}.zip.blockmap
+            dist/latest-mac-${{ matrix.arch }}.yml
+          if-no-files-found: error
+          retention-days: 7
+
+  # Só anexa a uma versão que o Windows já publicou, nunca cria uma: release novo sem o latest.yml
+  # do Windows viraria o "mais recente" e quebraria a atualização de quem está no Windows. Quando o
+  # Windows foi publicado numa hora e o Mac falhou, na hora seguinte "publicar" fica pulado e este
+  # job anexa só o Mac.
+  publicar-mac:
+    name: Publicar o Mac
+    needs: [decidir, mac, publicar]
+    if: ${{ !cancelled() && needs.mac.result == 'success' && (needs.publicar.result == 'success' || needs.publicar.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: v${{ needs.decidir.outputs.versao }}
+      VERSAO: ${{ needs.decidir.outputs.versao }}
+      MAC_ASSINADO: ${{ secrets.CSC_LINK != '' }}
+    steps:
+      - name: Pegar os arquivos do Mac
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          pattern: mac-*
+          merge-multiple: true
+          path: mac-assets
+
+      # O electron-updater escolhe o arquivo da arquitetura dentro da lista "files", então o
+      # latest-mac.yml publicado precisa ter os dois Macs.
+      - name: Juntar o latest-mac.yml e as somas
+        shell: bash
+        working-directory: mac-assets
+        run: |
+          set -euo pipefail
+          for arch in arm64 x64; do
+            if [ "$(yq '.version' "latest-mac-$arch.yml")" != "$VERSAO" ]; then
+              echo "::error::latest-mac-$arch.yml não é da versão $VERSAO."; exit 1
+            fi
+          done
+          yq eval-all '. as $item ireduce ({}; . *+ $item)' latest-mac-x64.yml latest-mac-arm64.yml > latest-mac.yml
+          for arch in arm64 x64; do
+            if [ "$(yq "[.files[].url | select(test(\"-$arch\\.zip\$\"))] | length" latest-mac.yml)" != "1" ]; then
+              echo "::error::latest-mac.yml sem o zip $arch."; exit 1
+            fi
+          done
+          rm latest-mac-arm64.yml latest-mac-x64.yml
+          cat latest-mac.yml
+          sha256sum Bunny-*.dmg Bunny-*.zip > SHA256SUMS-mac.txt
+          ls -la
+
+      - name: Publicar
+        shell: bash
+        run: |
+          if [ "$MAC_ASSINADO" = "true" ]; then
+            notas_mac="**Mac:** baixe **Bunny-*-arm64.dmg** (chip Apple, M1 ou mais novo) ou **Bunny-*-x64.dmg** (processador Intel), abra e arraste o Bunny para Aplicativos."
+          else
+            notas_mac="**Mac:** baixe **Bunny-*-arm64.dmg** (chip Apple, M1 ou mais novo) ou **Bunny-*-x64.dmg** (processador Intel), abra e arraste o Bunny para Aplicativos. O app ainda não é assinado pela Apple: na primeira vez, clique no Bunny com o botão direito e escolha Abrir; no macOS 15 ou mais novo, vá em Ajustes do Sistema > Privacidade e Segurança e clique em Abrir Mesmo Assim. Nesta versão o Mac não se atualiza sozinho: o Bunny avisa e leva à página de downloads."
+          fi
+          anexar() {
+            # Sem o instalador do Windows na versão, não é aqui que ela nasce.
+            if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q ".assets[].name" \
+              | grep -Fxq "Bunny-$VERSAO-x64.exe"; then
+              echo "A $TAG ainda não tem o instalador do Windows."
+              return 1
+            fi
+            gh release upload "$TAG" mac-assets/* --clobber --repo "$GITHUB_REPOSITORY" || return 1
+            corpo=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body) || return 1
+            if ! grep -q '\*\*Mac:\*\*' <<<"$corpo"; then
+              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes "$corpo"$'\n\n'"$notas_mac" || return 1
+            fi
+          }
+          # A API do GitHub às vezes responde 500 por alguns segundos: tenta de novo antes de falhar.
+          for attempt in 1 2 3 4 5; do
+            if anexar; then exit 0; fi
+            echo "Tentativa $attempt falhou; esperando para tentar de novo."
+            sleep $((attempt * 20))
+          done
+          echo "Não foi possível publicar o Mac depois de 5 tentativas."
           exit 1
