@@ -138,6 +138,58 @@ jobs:
             fi
           fi
 
+  # A mesma conferência do CI do código (lint, tipos, Go e TODOS os testes), feita aqui porque os
+  # commits entram direto na main e o CI de lá só roda em pull request. Antes só rodavam os testes
+  # de src/shared e src/main: a 1.44.0 e a 1.45.0 saíram com src/backend sem compilar nem testar.
+  # Roda ao lado do instalador do Windows, sem atrasá-lo; sem isto verde, nada é publicado.
+  conferir:
+    name: Conferir o código inteiro
+    needs: decidir
+    if: needs.decidir.outputs.gerar == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Baixar o código (privado, só leitura)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.decidir.outputs.commit }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - name: Instalar o Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.11
+
+      - name: Instalar o Go
+        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version: "1.26.x"
+          cache: false
+
+      - name: Instalar as dependências
+        run: bun install --frozen-lockfile
+
+      # Este registro é público: a saída fica em arquivo e só aparece qual etapa falhou.
+      - name: Lint, tipos, Go e todos os testes (só o resumo aparece)
+        shell: bash
+        run: |
+          etapa() {
+            nome="$1"; shift
+            if ! "$@" > "saida-$nome.log" 2>&1; then
+              grep -E '^\s*(Test Files|Tests)\s' "saida-$nome.log" || true
+              echo "::error::Falhou: $nome. Detalhes omitidos de propósito (registro público). Rode 'bun run check' no código."
+              exit 1
+            fi
+            echo "ok: $nome"
+          }
+          etapa go bun run test:go
+          etapa lint bun run lint
+          etapa tipos bun run typecheck
+          etapa testes bun run test
+          grep -E '^\s*(Test Files|Tests)\s' saida-testes.log || true
+
   windows:
     name: Gerar o instalador do Windows
     needs: decidir
@@ -243,7 +295,7 @@ jobs:
 
   publicar:
     name: Publicar a versão
-    needs: [decidir, windows]
+    needs: [decidir, windows, conferir]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
